@@ -9,6 +9,8 @@ import numpy as np # linear algebra
 import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
 from pathlib import Path 
 
+from encode import MusicEncode
+
 import os
 
 import torch
@@ -50,11 +52,14 @@ for dirname, _, filenames in os.walk(''):
         
 #Load test and training data
 DATA_ROOT = Path("data/")
-"""train = pd.read_csv(DATA_ROOT / 'train.tsv.zip', sep="\t")
-test = pd.read_csv(DATA_ROOT / 'test.tsv.zip', sep="\t")
+encode = MusicEncode()
+train = encode.midi_enc(DATA_ROOT / 'bwv772.mid')
+test = encode.midi_enc(DATA_ROOT / 'bwv772.mid')
+
 print(train.shape,test.shape)
-train.head()
-"""
+print(train)
+#train.head()
+
 
 # Parameters
 seed = 42
@@ -106,7 +111,7 @@ class TransformersBaseTokenizer(BaseTokenizer):
         return self
 
     def tokenizer(self, t:str) -> List[str]:
-        """Limits the maximum sequence length and add the spesial tokens"""
+        #Limits the maximum sequence length and add the spesial tokens
         CLS = self._pretrained_tokenizer.cls_token
         SEP = self._pretrained_tokenizer.sep_token
         if self.model_type in ['roberta']:
@@ -119,7 +124,7 @@ class TransformersBaseTokenizer(BaseTokenizer):
             else:
                 tokens = [CLS] + tokens + [SEP]
         return tokens
-    
+
 transformer_tokenizer = tokenizer_class.from_pretrained(pretrained_model_name)
 transformer_base_tokenizer = TransformersBaseTokenizer(pretrained_tokenizer = transformer_tokenizer, model_type = model_type)
 fastai_tokenizer = Tokenizer(tok_func = transformer_base_tokenizer, pre_rules=[], post_rules=[])
@@ -161,30 +166,32 @@ pad_first = bool(model_type in ['xlnet'])
 pad_idx = transformer_tokenizer.pad_token_id
 
 # Test tokenizing input
-""" 
+
 tokens = transformer_tokenizer.tokenize('Salut c est moi, Hello it s me')
 print(tokens)
 ids = transformer_tokenizer.convert_tokens_to_ids(tokens)
 print(ids)
 transformer_tokenizer.convert_ids_to_tokens(ids)
-"""
+
 
 # Loads and tokenizes the training data into a Databunch
-databunch = (TextList.from_df(train, cols='Phrase', processor=transformer_processor)
+"""
+databunch = (TextList.from_df(train[0:1727], processor=transformer_processor)
              .split_by_rand_pct(0.1,seed=seed)
-             .label_from_df(cols= 'Sentiment')
              .add_test(test)
              .databunch(bs=bs, pad_first=pad_first, pad_idx=pad_idx))
+
 
 # Verify correct input
 databunch.show_batch()
 test_one_batch = databunch.one_batch()[0]
 print('Batch shape : ',test_one_batch.shape)
 print(test_one_batch)
-
+"""
+databunch = train
 
 # Forward returns logits
-"""
+
 class CustomTransformerModel(nn.Module):
     def __init__(self, transformer_model: PreTrainedModel):
         super(CustomTransformerModel,self).__init__()
@@ -197,7 +204,7 @@ class CustomTransformerModel(nn.Module):
         logits = self.transformer(input_ids,
                                 attention_mask = attention_mask)[0]   
         return logits
-        """
+        
     
 # Specify the configuration
 config = config_class.from_pretrained(pretrained_model_name)

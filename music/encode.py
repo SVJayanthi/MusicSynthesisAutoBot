@@ -36,25 +36,27 @@ SEQType = Enum('SEQType', 'Mask, Sentence, Melody, Chords, Empty')
 #4 numpy array -> List[Timestep][NodeEncoding]
 
 class MusicEncode():
-
-    def midi_enc(midi_file, skip_last_rest=True):
-        stream = file_stream(midi_file)
-        chord_arr = stream_chordarr(stream)
-        return chordarr_npenc(chord_arr, skip_last_rest=skip_last_rest)
+    
+    # Midi Encoding Method
+    def midi_enc(self, midi_file, skip_last_rest=True):
+        stream = self.file_stream(midi_file)
+        chord_arr = self.stream_chordarr(stream)
+        enc =  self.chordarr_npenc(chord_arr, skip_last_rest=skip_last_rest)
+        vocab = MusicVocab.create()
+        return self.npenc2idxenc(enc, vocab)
     
     #File to stream
-    def file_stream(path):
+    def file_stream(self, path):
         if isinstance(path, music21.midi.MidiFile): return music21.midi.translate.midiFileToStream(path)
         return music21.converter.parse(path)
     
     #Stream to array
-    def stream_chordarr(stream, note_size=NOTE_SIZE, sample_freq=SAMPLE_FREQ, max_note_dur=MAX_NOTE_DUR):
+    def stream_chordarr(self, stream, note_size=NOTE_SIZE, sample_freq=SAMPLE_FREQ, max_note_dur=MAX_NOTE_DUR):
         """
         4/4 time
         note * instrument * pitch
         """
         
-        # (AS) TODO: need to order by instruments most played and filter out percussion or include the channel
         highest_time = max(stream.flat.getElementsByClass('Note').highestTime, stream.flat.getElementsByClass('Chord').highestTime)
         maxTimeStep = round(highest_time * sample_freq)+1
         score_arr = np.zeros((maxTimeStep, len(stream.parts), NOTE_SIZE))
@@ -82,12 +84,12 @@ class MusicEncode():
         return score_arr
     
     # Convert array to NP Encoding
-    def chordarr_npenc(chordarr, skip_last_rest=True):
+    def chordarr_npenc(self, chordarr, skip_last_rest=True):
         # combine instruments
         result = []
         wait_count = 0
         for idx,timestep in enumerate(chordarr):
-            flat_time = timestep2npenc(timestep)
+            flat_time = self.timestep2npenc(timestep)
             if len(flat_time) == 0:
                 wait_count += 1
             else:
@@ -99,7 +101,7 @@ class MusicEncode():
         return np.array(result, dtype=int).reshape(-1, 2) # reshaping. Just in case result is empty
     
     # Note: not worrying about overlaps - as notes will still play. just look tied
-    def timestep2npenc(timestep, note_range=PIANO_RANGE, enc_type=None):
+    def timestep2npenc(self, timestep, note_range=PIANO_RANGE, enc_type=None):
         # inst x pitch
         notes = []
         for i,n in zip(*timestep.nonzero()):
@@ -123,36 +125,39 @@ class MusicEncode():
     
     # Convering np encodings into Tensors for use in model
         # single stream instead of note,dur
-    def npenc2idxenc(t, vocab, seq_type=SEQType.Sentence, add_eos=False):
+    def npenc2idxenc(self, t, vocab, seq_type=SEQType.Sentence, add_eos=False):
         "Transforms numpy array from 2 column (note, duration) matrix to a single column"
         "[[n1, d1], [n2, d2], ...] -> [n1, d1, n2, d2]"
         if isinstance(t, (list, tuple)) and len(t) == 2: 
-            return [npenc2idxenc(x, vocab) for x in t]
+            return [self.npenc2idxenc(x, vocab) for x in t]
         t = t.copy()
         
         t[:, 0] = t[:, 0] + vocab.note_range[0]
         t[:, 1] = t[:, 1] + vocab.dur_range[0]
         
-        prefix = seq_prefix(seq_type, vocab)
+        prefix = self.seq_prefix(seq_type, vocab)
         suffix = np.array([vocab.stoi[EOS]]) if add_eos else np.empty(0, dtype=int)
         return np.concatenate([prefix, t.reshape(-1), suffix])
     
-    def seq_prefix(seq_type, vocab):
+    def seq_prefix(self, seq_type, vocab):
         if seq_type == SEQType.Empty: return np.empty(0, dtype=int)
         start_token = vocab.bos_idx
         if seq_type == SEQType.Chords: start_token = vocab.stoi[CSEQ]
         if seq_type == SEQType.Melody: start_token = vocab.stoi[MSEQ]
         return np.array([start_token, vocab.pad_idx])
+    
 
 if __name__ == '__main__':
     #print(midi_enc("bwv772.mid"));
     midi_file = "data/bwv772.mid"
-    stream = file_stream(midi_file)
+    
+    encode = MusicEncode()
+    stream = encode.file_stream(midi_file)
     #stream.show('text')
     #stream.show()
     #stream.show('midi')
 
-    chord_arr = stream_chordarr(stream)
+    chord_arr = encode.stream_chordarr(stream)
     print(chord_arr)
     ts1 = chord_arr[0].nonzero()
     c = music21.chord.Chord(ts1[1].tolist())
@@ -160,7 +165,7 @@ if __name__ == '__main__':
     print(c)
 
 
-    enc = chordarr_npenc(chord_arr, True)
+    enc = encode.chordarr_npenc(chord_arr, True)
     print(enc.shape)
     print(enc)
     
@@ -174,9 +179,11 @@ if __name__ == '__main__':
     
     vocab = MusicVocab.create()
     
-    idxenc = npenc2idxenc(enc, vocab)
+    idxenc = encode.npenc2idxenc(enc, vocab)
     print(idxenc.shape)
     print(idxenc)
+    print(idxenc[0:5])
+    print(idxenc[0:5].shape)
     print(vocab.stoi.items())
     
     
