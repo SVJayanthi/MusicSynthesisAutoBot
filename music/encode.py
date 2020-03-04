@@ -37,13 +37,16 @@ SEQType = Enum('SEQType', 'Mask, Sentence, Melody, Chords, Empty')
 
 class MusicEncode():
     
+    # Initialize
+    def __init__(self, vocabM):
+        self.vocab = vocabM
+    
     # Midi Encoding Method
     def midi_enc(self, midi_file, skip_last_rest=True):
         stream = self.file_stream(midi_file)
         chord_arr = self.stream_chordarr(stream)
         enc =  self.chordarr_npenc(chord_arr, skip_last_rest=skip_last_rest)
-        vocab = MusicVocab.create()
-        return self.npenc2idxenc(enc, vocab)
+        return self.npenc2idxenc(enc, self.vocab)
     
     #File to stream
     def file_stream(self, path):
@@ -151,7 +154,8 @@ if __name__ == '__main__':
     #print(midi_enc("bwv772.mid"));
     midi_file = "data/bwv772.mid"
     
-    encode = MusicEncode()
+    vocab = MusicVocab.create()
+    encode = MusicEncode(vocab)
     stream = encode.file_stream(midi_file)
     #stream.show('text')
     #stream.show()
@@ -177,7 +181,6 @@ if __name__ == '__main__':
     print(c)
     print(enc[:8])
     
-    vocab = MusicVocab.create()
     
     idxenc = encode.npenc2idxenc(enc, vocab)
     print(idxenc.shape)
