@@ -93,7 +93,8 @@ class Midi2ItemProcessor(PreProcessor):
     "Skips midi preprocessing step. And encodes midi files to MusicItems"
     def process_one(self,item):
         encode = MusicEncode(self.vocab)
-        item = MusicItem.from_file(item, vocab=self.vocab, encode = encode)
+        if not isinstance(item, MusicItem): 
+            item = MusicItem.from_file(str(item), vocab=self.vocab, encode = encode)
         return item.to_idx()
     
     def process(self, ds):

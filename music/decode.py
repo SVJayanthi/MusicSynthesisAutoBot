@@ -10,7 +10,20 @@ import numpy as np
 
 #import vocab
 from vocab import *
+from encode import *
 from enum import Enum
+
+
+# Decoding process
+# 1. NoteEnc -> numpy chord array
+# 2. numpy array -> music21.Stream
+def npenc2stream(arr, bpm=120):
+    "Converts numpy encoding to music21 stream"
+    chordarr = npenc2chordarr(np.array(arr)) # 1.
+    return chordarr2stream(chordarr, bpm=bpm) # 2.
+
+def stream2file(stream):
+    if isinstance(stream, music21.stream.Stream): return music21.midi.translate.streamToMidiFile(stream)
 
 ##### DECODING #####
 
@@ -170,7 +183,7 @@ def shorten_chordarr_rests(arr, max_rests=8, sample_freq=SAMPLE_FREQ):
 # sequence 2 sequence convenience functions
 
 def stream2npenc_parts(stream, sort_pitch=True):
-    chordarr = stream2chordarr(stream)
+    chordarr = stream_chordarr(stream)
     _,num_parts,_ = chordarr.shape
     parts = [part_enc(chordarr, i) for i in range(num_parts)]
     return sorted(parts, key=avg_pitch, reverse=True) if sort_pitch else parts
@@ -187,7 +200,7 @@ def pad_part_to(p, target_size):
 
 def part_enc(chordarr, part):
     partarr = chordarr[:,part:part+1,:]
-    npenc = chordarr2npenc(partarr)
+    npenc = chordarr_npenc(partarr)
     return npenc
 
 def avg_tempo(t, sep_idx=VALTSEP):

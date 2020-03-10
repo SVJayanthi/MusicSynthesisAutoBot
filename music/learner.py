@@ -4,10 +4,14 @@ Created on Mon Mar  2 22:31:17 2020
 
 @author: srava
 """
+from fastai.basics import *
+from fastai.text.learner import LanguageLearner, get_language_model, _model_meta
+from encode import SAMPLE_FREQ
+from fastai.text import *
 
-import numpy as np # linear algebra
-import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
-from pathlib import Path 
+
+import torch
+import torch.nn.functional as F
 
 from encode import MusicEncode
 from vocab import MusicVocab
@@ -15,397 +19,287 @@ from transform import MusicItem
 from dataloader import *
 from config import *
 
-import os
 
-import torch
-import torch.optim as optim
+def music_model_learner(data:DataBunch, arch=TransformerXL, config:dict=None, drop_mult:float=1.,
+                        pretrained_path:PathOrStr=None, **learn_kwargs) -> 'LanguageLearner':
+    "Create a `Learner` with a language model from `data` and `arch`."
+    meta = _model_meta[arch]
 
-import random 
-
-# fastai
-from fastai import *
-from fastai.text import *
-from fastai.callbacks import *
-from fastai.basic_data import DataBunch
-from fastai import basic_train
-
-from fastai.basics import *
-from fastai.text.learner import LanguageLearner, get_language_model
-
-import fastai
-import transformers
-
-#Show files in directory
-"""
-for dirname, _, filenames in os.walk(''):
-    for filename in filenames:
-        print(os.path.join(dirname, filename))
-        """
+    if pretrained_path: 
+        state = torch.load(pretrained_path, map_location='cpu')
+        if config is None: config = state['config']
         
-#Load test and training data
-DATA_ROOT = Path("data/")
-vocab = MusicVocab.create()
-encode = MusicEncode(vocab)
-train = encode.midi_enc(DATA_ROOT / 'bwv772.mid')
-test = encode.midi_enc(DATA_ROOT / 'bwv772.mid')
+    model = get_language_model(arch, len(data.vocab.itos), config=config, drop_mult=drop_mult)
+    learn = MusicLearner(data, model, split_func=meta['split_lm'], **learn_kwargs)
 
-print(train.shape,test.shape)
-print(train)
-#train.head()
+    if pretrained_path: 
+        get_model(model).load_state_dict(state['model'], strict=False)
+        if not hasattr(learn, 'opt'): learn.create_opt(defaults.lr, learn.wd)
+        try:    learn.opt.load_state_dict(state['opt'])
+        except: pass
+        del state
+        gc.collect()
+
+    return learn
+
+# Predictions
+from fastai import basic_train # for predictions
+class MusicLearner(LanguageLearner):
+    def save(self, file:PathLikeOrBinaryStream=None, with_opt:bool=True, config=None):
+        "Save model and optimizer state (if `with_opt`) with `file` to `self.model_dir`. `file` can be file-like (file or buffer)"
+        out_path = super().save(file, return_path=True, with_opt=with_opt)
+        if config and out_path:
+            state = torch.load(out_path)
+            state['config'] = config
+            torch.save(state, out_path)
+            del state
+            gc.collect()
+        return out_path
+
+    def beam_search(self, xb:Tensor, n_words:int, top_k:int=10, beam_sz:int=10, temperature:float=1.,
+                    ):
+        "Return the `n_words` that come after `text` using beam search."
+        self.model.reset()
+        self.model.eval()
+        xb_length = xb.shape[-1]
+        if xb.shape[0] > 1: xb = xb[0][None]
+        yb = torch.ones_like(xb)
+
+        nodes = None
+        xb = xb.repeat(top_k, 1)
+        nodes = xb.clone()
+        scores = xb.new_zeros(1).float()
+        with torch.no_grad():
+            for k in progress_bar(range(n_words), leave=False):
+                out = F.log_softmax(self.model(xb)[0][:,-1], dim=-1)
+                values, indices = out.topk(top_k, dim=-1)
+                scores = (-values + scores[:,None]).view(-1)
+                indices_idx = torch.arange(0,nodes.size(0))[:,None].expand(nodes.size(0), top_k).contiguous().view(-1)
+                sort_idx = scores.argsort()[:beam_sz]
+                scores = scores[sort_idx]
+                nodes = torch.cat([nodes[:,None].expand(nodes.size(0),top_k,nodes.size(1)),
+                                indices[:,:,None].expand(nodes.size(0),top_k,1),], dim=2)
+                nodes = nodes.view(-1, nodes.size(2))[sort_idx]
+                self.model[0].select_hidden(indices_idx[sort_idx])
+                xb = nodes[:,-1][:,None]
+        if temperature != 1.: scores.div_(temperature)
+        node_idx = torch.multinomial(torch.exp(-scores), 1).item()
+        return [i.item() for i in nodes[node_idx][xb_length:] ]
+
+    def predict(self, item:MusicItem, n_words:int=128,
+                     temperatures:float=(1.0,1.0), min_bars=4,
+                     top_k=30, top_p=0.6):
+        "Return the `n_words` that come after `text`."
+        self.model.reset()
+        new_idx = []
+        vocab = self.data.vocab
+        x, pos = item.to_tensor(), item.get_pos_tensor()
+        last_pos = pos[-1] if len(pos) else 0
+        y = torch.tensor([0])
+
+        start_pos = last_pos
+
+        sep_count = 0
+        bar_len = SAMPLE_FREQ * 4 # assuming 4/4 time
+        vocab = self.data.vocab
+
+        repeat_count = 0
+        if hasattr(self.model[0], 'encode_position'):
+            encode_position = self.model[0].encode_position
+        else: encode_position = False
+
+        for i in progress_bar(range(n_words), leave=True):
+            with torch.no_grad():
+                if encode_position:
+                    batch = { 'x': x[None], 'pos': pos[None] }
+                    logits = self.model(batch)[0][-1][-1]
+                else:
+                    logits = self.model(x[None])[0][-1][-1]
+
+            prev_idx = new_idx[-1] if len(new_idx) else vocab.pad_idx
+
+            # Temperature
+            # Use first temperatures value if last prediction was duration
+            temperature = temperatures[0] if vocab.is_duration_or_pad(prev_idx) else temperatures[1]
+            repeat_penalty = max(0, np.log((repeat_count+1)/4)/5) * temperature
+            temperature += repeat_penalty
+            if temperature != 1.: logits = logits / temperature
+                
+
+            # Filter
+            # bar = 16 beats
+            filter_value = -float('Inf')
+            if ((last_pos - start_pos) // 16) <= min_bars: logits[vocab.bos_idx] = filter_value
+
+            logits = filter_invalid_indexes(logits, prev_idx, vocab, filter_value=filter_value)
+            logits = top_k_top_p(logits, top_k=top_k, top_p=top_p, filter_value=filter_value)
+            
+            # Sample
+            probs = F.softmax(logits, dim=-1)
+            idx = torch.multinomial(probs, 1).item()
+
+            # Update repeat count
+            num_choices = len(probs.nonzero().view(-1))
+            if num_choices <= 2: repeat_count += 1
+            else: repeat_count = repeat_count // 2
+
+            if prev_idx==vocab.sep_idx: 
+                duration = idx - vocab.dur_range[0]
+                last_pos = last_pos + duration
+
+                bars_pred = (last_pos - start_pos) // 16
+                abs_bar = last_pos // 16
+                # if (bars % 8 == 0) and (bars_pred > min_bars): break
+                if (i / n_words > 0.80) and (abs_bar % 4 == 0): break
 
 
-"""
-# Find the seed to use for training
-def seed_all(seed_value):
-    random.seed(seed_value) # Python
-    np.random.seed(seed_value) # cpu vars
-    torch.manual_seed(seed_value) # cpu  vars
+            if idx==vocab.bos_idx: 
+                print('Predicted BOS token. Returning prediction...')
+                break
+
+            new_idx.append(idx)
+            x = x.new_tensor([idx])
+            pos = pos.new_tensor([last_pos])
+
+        #pred = vocab.to_music_item(np.array(new_idx))
+        pred = MusicItem(np.array(new_idx), vocab)
+        full = item.append(pred)
+        return pred, full
     
-    if torch.cuda.is_available(): 
-        torch.cuda.manual_seed(seed_value)
-        torch.cuda.manual_seed_all(seed_value) # gpu vars
-        torch.backends.cudnn.deterministic = True  #needed
-        torch.backends.cudnn.benchmark = False
-        
-#seed_all(seed)
-        """
-        
-data_path = Path('data/numpy')
-midi_files = get_files(DATA_ROOT, '.mid', recurse=True)
-data = MusicDataBunch.from_files(midi_files, data_path, processors=[Midi2ItemProcessor()], bs=4, bptt=128, encode_position=False)
-
-dataE = MusicDataBunch.empty(DATA_ROOT / 'bwv772.mid')
-print(dataE)
-
-databunch = DataBunch.create(train_ds = train, valid_ds = test, test_ds = test)
-#print(databunch)
-
-
-
-batch_size = 1
-encode_position = True
-#dl_tfms = [batch_position_tfm] if encode_position else []
-
-config = default_config()
-#config['encode_position'] = encode_position
-#learn = music_model_learner(data, config=config.copy())
-print(config)
-
-model = get_language_model(arch=TransformerXL, vocab_sz=vocab.__len__(), config = config, drop_mult = 1.)
-
-learn = LanguageLearner(data, model)
-
-learn.fit_one_cycle(4)
-
-learn.save('example')
-
-
-cutoff_beat = 10
-
-"""
-item = MusicItem(encode.midi_enc(DATA_ROOT / 'bwv772.mid'), vocab, encode.file_stream(DATA_ROOT / 'bwv772.mid'))
-seed_item = item.trim_to_beat(cutoff_beat)
-print(seed_item)
-print(learn.predict(seed_item, n_words = 400, temperature=1.))
-"""
-
-
-midi_file = (DATA_ROOT / 'bwv772.mid')
-item = MusicItem.from_file(midi_file, data.vocab, encode);
-print(item)
-pred = learn.predict(item, n_words=10)
-pred.show()
-
-"""
-# Parameters
-seed = 42
-use_fp16 = False
-bs = 16
-
-
-model_type = 'roberta'
-pretrained_model_name = 'roberta-base'
-
-# model_type = 'bert'
-# pretrained_model_name='bert-base-uncased'
-
-# model_type = 'distilbert'
-# pretrained_model_name = 'distilbert-base-uncased'
-
-#model_type = 'xlm'
-#pretrained_model_name = 'xlm-clm-enfr-1024'
-
-# model_type = 'xlnet'
-# pretrained_model_name = 'xlnet-base-cased'
-
-
-model_class, tokenizer_class, config_class = MODEL_CLASSES[model_type]
-model_class.pretrained_model_archive_map.keys()
-"""
-
-"""
-# Wrapper around PreTrainedTokenizer to be compatible with fast.ai
-class TransformersBaseTokenizer(BaseTokenizer):
-    def __init__(self, pretrained_tokenizer: PreTrainedTokenizer, model_type = 'bert', **kwargs):
-        self._pretrained_tokenizer = pretrained_tokenizer
-        self.max_seq_len = pretrained_tokenizer.max_len
-        self.model_type = model_type
-
-    def __call__(self, *args, **kwargs): 
-        return self
-
-    def tokenizer(self, t:str) -> List[str]:
-        #Limits the maximum sequence length and add the spesial tokens
-        CLS = self._pretrained_tokenizer.cls_token
-        SEP = self._pretrained_tokenizer.sep_token
-        if self.model_type in ['roberta']:
-            tokens = self._pretrained_tokenizer.tokenize(t, add_prefix_space=True)[:self.max_seq_len - 2]
-            tokens = [CLS] + tokens + [SEP]
-        else:
-            tokens = self._pretrained_tokenizer.tokenize(t)[:self.max_seq_len - 2]
-            if self.model_type in ['xlnet']:
-                tokens = tokens + [SEP] +  [CLS]
-            else:
-                tokens = [CLS] + tokens + [SEP]
-        return tokens
-
-transformer_tokenizer = tokenizer_class.from_pretrained(pretrained_model_name)
-transformer_base_tokenizer = TransformersBaseTokenizer(pretrained_tokenizer = transformer_tokenizer, model_type = model_type)
-fastai_tokenizer = Tokenizer(tok_func = transformer_base_tokenizer, pre_rules=[], post_rules=[])
-
-# Adapt to Vocab object as wrapper for fast.ai
-class TransformersVocab(Vocab):
-    def __init__(self, tokenizer: PreTrainedTokenizer):
-        super(TransformersVocab, self).__init__(itos = [])
-        self.tokenizer = tokenizer
-    
-    def numericalize(self, t:Collection[str]) -> List[int]:
-        "Convert a list of tokens `t` to their ids."
-        return self.tokenizer.convert_tokens_to_ids(t)
-        #return self.tokenizer.encode(t)
-
-    def textify(self, nums:Collection[int], sep=' ') -> List[str]:
-        "Convert a list of `nums` to their tokens."
-        nums = np.array(nums).tolist()
-        return sep.join(self.tokenizer.convert_ids_to_tokens(nums)) if sep is not None else self.tokenizer.convert_ids_to_tokens(nums)
-    
-    def __getstate__(self):
-        return {'itos':self.itos, 'tokenizer':self.tokenizer}
-
-    def __setstate__(self, state:dict):
-        self.itos = state['itos']
-        self.tokenizer = state['tokenizer']
-        self.stoi = collections.defaultdict(int,{v:k for k,v in enumerate(self.itos)})
-        
-# Creating process for tokenizer and numericalizer
-transformer_vocab =  TransformersVocab(tokenizer = transformer_tokenizer)
-numericalize_processor = NumericalizeProcessor(vocab=transformer_vocab)
-
-tokenize_processor = TokenizeProcessor(tokenizer=fastai_tokenizer, include_bos=False, include_eos=False)
-
-transformer_processor = [tokenize_processor, numericalize_processor]
-
-# Pad the inputs with Xlnet
-pad_first = bool(model_type in ['xlnet'])
-pad_idx = transformer_tokenizer.pad_token_id
-
-
-# Test tokenizing input
-tokens = transformer_tokenizer.tokenize('Salut c est moi, Hello it s me')
-print(tokens)
-ids = transformer_tokenizer.convert_tokens_to_ids(tokens)
-print(ids)
-transformer_tokenizer.convert_ids_to_tokens(ids)
-
-
-# Loads and tokenizes the training data into a Databunch
-
-databunch = (TextList.from_df(train[0:1727], processor=transformer_processor)
-             .split_by_rand_pct(0.1,seed=seed)
-             .add_test(test)
-             .databunch(bs=bs, pad_first=pad_first, pad_idx=pad_idx))
-
-
-# Verify correct input
-databunch.show_batch()
-test_one_batch = databunch.one_batch()[0]
-print('Batch shape : ',test_one_batch.shape)
-print(test_one_batch)
-
-# Forward returns logits
-
-class CustomTransformerModel(nn.Module):
-    def __init__(self, transformer_model: PreTrainedModel):
-        super(CustomTransformerModel,self).__init__()
-        self.transformer = transformer_model
-        
-    def forward(self, input_ids, attention_mask=None):
-        
-        #attention_mask = (input_ids!=1).type(input_ids.type()) # Test attention_mask for RoBERTa
-        
-        logits = self.transformer(input_ids,
-                                attention_mask = attention_mask)[0]   
-        return logits
-        
-
-#data = DataBunch()
-
-
-
-# Specify the configuration
-config = config_class.from_pretrained(pretrained_model_name)
-#config.num_labels = 5
-config.use_bfloat16 = use_fp16
-print(config)
-
-# Load NLP model
-transformer_model = model_class.from_pretrained(pretrained_model_name, config = config)
-
-
-# AdamW optimizer for learning
-from fastai.callbacks import *
-from transformers import AdamW
-from functools import partial
-
-CustomAdamW = partial(AdamW, correct_bias=False)
-
-learner = Learner(databunch, 
-                  transformer_model, 
-                  opt_func = CustomAdamW, 
-                  metrics=[accuracy, error_rate])
-
-# Show graph of learner stats and metrics after each epoch.
-#learner.callbacks.append(ShowGraph(learner))
-
-# Put learn in FP16 precision mode. --> Seems to not working
-if use_fp16: learner = learner.to_fp16()
-
-# Display learning model
-print(learner.model)
-
-
-# Architecture specifications
-
-# For DistilBERT
-# list_layers = [learner.model.transformer.distilbert.embeddings,
-#                learner.model.transformer.distilbert.transformer.layer[0],
-#                learner.model.transformer.distilbert.transformer.layer[1],
-#                learner.model.transformer.distilbert.transformer.layer[2],
-#                learner.model.transformer.distilbert.transformer.layer[3],
-#                learner.model.transformer.distilbert.transformer.layer[4],
-#                learner.model.transformer.distilbert.transformer.layer[5],
-#                learner.model.transformer.pre_classifier]
-
-# For xlnet-base-cased
-# list_layers = [learner.model.transformer.transformer.word_embedding,
-#               learner.model.transformer.transformer.layer[0],
-#               learner.model.transformer.transformer.layer[1],
-#               learner.model.transformer.transformer.layer[2],
-#               learner.model.transformer.transformer.layer[3],
-#               learner.model.transformer.transformer.layer[4],
-#               learner.model.transformer.transformer.layer[5],
-#               learner.model.transformer.transformer.layer[6],
-#               learner.model.transformer.transformer.layer[7],
-#               learner.model.transformer.transformer.layer[8],
-#               learner.model.transformer.transformer.layer[9],
-#               learner.model.transformer.transformer.layer[10],
-#               learner.model.transformer.transformer.layer[11],
-#               learner.model.transformer.sequence_summary]
-
-
-# For roberta-base
-list_layers = [learner.model.transformer.roberta.embeddings,
-              learner.model.transformer.roberta.encoder.layer[0],
-              learner.model.transformer.roberta.encoder.layer[1],
-              learner.model.transformer.roberta.encoder.layer[2],
-              learner.model.transformer.roberta.encoder.layer[3],
-              learner.model.transformer.roberta.encoder.layer[4],
-              learner.model.transformer.roberta.encoder.layer[5],
-              learner.model.transformer.roberta.encoder.layer[6],
-              learner.model.transformer.roberta.encoder.layer[7],
-              learner.model.transformer.roberta.encoder.layer[8],
-              learner.model.transformer.roberta.encoder.layer[9],
-              learner.model.transformer.roberta.encoder.layer[10],
-              learner.model.transformer.roberta.encoder.layer[11],
-              learner.model.transformer.roberta.pooler]
-
-# Split layers into groups
-learner.split(list_layers)
-num_groups = len(learner.layer_groups)
-print('Learner split in',num_groups,'groups')
-print(learner.layer_groups)
-"""
-
-# Training through Slanted Triangular Learning Rates, Discriminate Learning Rate and gradually unfreeze the model
-# Begin training
-learner.save('untrain')
-seed_all(seed)
-learner.load('untrain');
-
-# Freeze all groups except classifier for training
-learner.freeze_to(-1)
-
-# Check which is available
-#learner.summary()
-
-"""
-1. We progressively increase our learning rate from lr_max/div_factor to lr_max and at the same time we progressively decrease our momentum from mom_max to mom_min.
-2. We do the exact opposite: we progressively decrease our learning rate from lr_max to lr_max/div_factor and at the same time we progressively increase our momentum from mom_min to mom_max.
-3. We further decrease our learning rate from lr_max/div_factor to lr_max/(div_factor x 100) and we keep momentum steady at mom_max.
-"""
-
-# Slanted Traingular Learning One cycle funciton for learning using optimal learning rates
-learner.lr_find()
-learner.recorder.plot(skip_end=10,suggestion=True)
-
-# Using optimal rate from above, traing layer
-learner.fit_one_cycle(1,max_lr=2e-03,moms=(0.8,0.7))
-
-learner.save('first_cycle')
-seed_all(seed)
-learner.load('first_cycle')
-
-# Unfreeze second to last layer
-learner.freeze_to(-2)
-lr = 1e-5
-learner.fit_one_cycle(1, max_lr=slice(lr*0.95**num_groups, lr), moms=(0.8, 0.9))
-
-learner.save('second_cycle')
-seed_all(seed)
-learner.load('second_cycle');
-
-learner.freeze_to(-3)
-learner.fit_one_cycle(1, max_lr=slice(lr*0.95**num_groups, lr), moms=(0.8, 0.9))
-
-learner.save('third_cycle')
-seed_all(seed)
-learner.load('third_cycle');
-
-learner.unfreeze()
-learner.fit_one_cycle(2, max_lr=slice(lr*0.95**num_groups, lr), moms=(0.8, 0.9))
-
-# Use to predict from input strings
-# learner.predict
-
-
-# Create predictions from dataset
-# Predication methods do not yield elements
-def get_preds_as_nparray(ds_type) -> np.ndarray:
+# High level prediction functions from midi file
+def predict_from_midi(learn, midi=None, n_words=400, 
+                      temperatures=(1.0,1.0), top_k=30, top_p=0.6, seed_len=None, **kwargs):
+    vocab = learn.data.vocab
+    seed = MusicItem.from_file(midi, vocab)
+    if seed_len is not None: seed = seed.trim_to_beat(seed_len)
+
+    pred, full = learn.predict(seed, n_words=n_words, temperatures=temperatures, top_k=top_k, top_p=top_p, **kwargs)
+    return full
+
+def filter_invalid_indexes(res, prev_idx, vocab, filter_value=-float('Inf')):
+    if vocab.is_duration_or_pad(prev_idx):
+        res[list(range(*vocab.dur_range))] = filter_value
+    else:
+        res[list(range(*vocab.note_range))] = filter_value
+    return res
+
+__all__ = ['top_k_top_p']
+
+# top_k + nucleus filter - https://twitter.com/thom_wolf/status/1124263861727760384?lang=en
+# https://gist.github.com/thomwolf/1a5a29f6962089e871b94cbd09daf317
+def top_k_top_p(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
+    """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
+        Args:
+            logits: logits distribution shape (vocabulary size)
+            top_k >0: keep only top k tokens with highest probability (top-k filtering).
+            top_p >0.0: keep the top tokens with cumulative probability >= top_p (nucleus filtering).
     """
-    the get_preds method does not yield the elements in order by default
-    we borrow the code from the RNNLearner to resort the elements into their correct order
+    logits = logits.clone()
+    assert logits.dim() == 1  # batch size 1 for now - could be updated for more but the code would be less clear
+    top_k = min(top_k, logits.size(-1))  # Safety check
+    if top_k > 0:
+        # Remove all tokens with a probability less than the last token of the top-k
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits[indices_to_remove] = filter_value
+
+    if top_p > 0.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+        # Remove tokens with cumulative probability above the threshold
+        sorted_indices_to_remove = cumulative_probs > top_p
+        # Shift the indices to the right to keep also the first token above the threshold
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+
+        indices_to_remove = sorted_indices[sorted_indices_to_remove]
+        logits[indices_to_remove] = filter_value
+    return logits
+
+if __name__ == '__main__':
+    #Show files in directory
     """
-    preds = learner.get_preds(ds_type)[0].detach().cpu().numpy()
-    sampler = [i for i in databunch.dl(ds_type).sampler]
-    reverse_sampler = np.argsort(sampler)
-    return preds[reverse_sampler, :]
+    for dirname, _, filenames in os.walk(''):
+        for filename in filenames:
+            print(os.path.join(dirname, filename))
+            """
+            
+    #Load test and training data
+    DATA_ROOT = Path("data/")
+    vocab = MusicVocab.create()
+    encode = MusicEncode(vocab)
+    train = encode.midi_enc(DATA_ROOT / 'bwv772.mid')
+    test = encode.midi_enc(DATA_ROOT / 'bwv772.mid')
+    
+    print(train.shape,test.shape)
+    print(train)
+    #train.head()
+    
+    
+    """
+    # Find the seed to use for training
+    def seed_all(seed_value):
+        random.seed(seed_value) # Python
+        np.random.seed(seed_value) # cpu vars
+        torch.manual_seed(seed_value) # cpu  vars
+        
+        if torch.cuda.is_available(): 
+            torch.cuda.manual_seed(seed_value)
+            torch.cuda.manual_seed_all(seed_value) # gpu vars
+            torch.backends.cudnn.deterministic = True  #needed
+            torch.backends.cudnn.benchmark = False
+            
+    #seed_all(seed)
+            """
+            
+    data_path = Path('data/numpy')
+    midi_files = get_files(DATA_ROOT, '.mid', recurse=True)
+    data = MusicDataBunch.from_files(midi_files, data_path, processors=[Midi2ItemProcessor()], bs=1, bptt=128, encode_position=False)
+    
+    dataE = MusicDataBunch.empty(DATA_ROOT / 'bwv772.mid')
+    print(dataE)
+    
+    databunch = DataBunch.create(train_ds = train, valid_ds = test, test_ds = test)
+    #print(databunch)
+    
+    
+    
+    batch_size = 1
+    encode_position = True
+    #dl_tfms = [batch_position_tfm] if encode_position else []
+    
+    config = default_config()
+    #config['encode_position'] = encode_position
+    #learn = music_model_learner(data, config=config.copy())
+    print(config)
+    
+    #model = get_language_model(arch=TransformerXL, vocab_sz=vocab.__len__(), config = config, drop_mult = 1.)
+    
+    learn = music_model_learner(data = data, config = config)
+    
+    learn.fit_one_cycle(4)
+    
+    learn.save('example')
+    
+    
+    cutoff_beat = 10
+    
+    """
+    item = MusicItem(encode.midi_enc(DATA_ROOT / 'bwv772.mid'), vocab, encode.file_stream(DATA_ROOT / 'bwv772.mid'))
+    seed_item = item.trim_to_beat(cutoff_beat)
+    print(seed_item)
+    print(learn.predict(seed_item, n_words = 400, temperature=1.))
+    """
+    
+    
+    midi_file = (DATA_ROOT / 'bwv772.mid')
+    item = MusicItem.from_file(midi_file, data.vocab, encode);
+    #print(item)
+    
+    pred, full = learn.predict(item, n_words=1000)
+    print(pred.stream)
+    print(pred.play())
+    
+    midi_F = pred.write("bwv_output.mid")
+    
 
-test_preds = get_preds_as_nparray(DatasetType.Test)
-
-# Write predictions into predictions csv
-train = encode.midi_enc(DATA_ROOT / 'bwv772.mid')
-sample_submission = pd.read_csv(DATA_ROOT / 'sampleSubmission.vcsv')
-sample_submission['Sentiment'] = np.argmax(test_preds,axis=1)
-sample_submission.to_csv("predictions.csv", index=False)
-test.head()
-sample_submission.head()

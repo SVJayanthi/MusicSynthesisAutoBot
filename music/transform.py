@@ -7,6 +7,7 @@ Created on Tue Mar  3 01:24:47 2020
 
 from encode import *
 from encode import MusicEncode
+from decode import *
 import numpy as np
 from enum import Enum
 import torch
@@ -63,6 +64,10 @@ class MusicItem():
         return to_tensor(self.data, device)
     
     def to_text(self, sep=' '): return self.vocab.textify(self.data, sep)
+    
+    def to_file(self): return stream2file(self.stream)
+    
+    def write(self, file_path): self.stream.write('midi', fp=file_path)
     
     @property
     def position(self): 
