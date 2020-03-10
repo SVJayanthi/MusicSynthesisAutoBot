@@ -3,7 +3,6 @@ from encode import *
 import numpy as np
 from enum import Enum
 import torch
-#from .music_transformer import transform
 
 BOS = 'xxbos'
 PAD = 'xxpad'
@@ -53,7 +52,7 @@ class MusicVocab():
         return sep.join(items) if sep is not None else items
     
     def to_music_item(self, idxenc):
-        return transform.MusicItem(idxenc, self)
+        return MusicItem(idxenc, self)
     
     @property 
     def mask_idx(self): return self.stoi[MASK]
