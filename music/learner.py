@@ -216,64 +216,23 @@ def top_k_top_p(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
         logits[indices_to_remove] = filter_value
     return logits
 
-if __name__ == '__main__':
-    #Show files in directory
-    """
-    for dirname, _, filenames in os.walk(''):
-        for filename in filenames:
-            print(os.path.join(dirname, filename))
-            """
-            
+if __name__ == '__main__':            
     #Load test and training data
     DATA_ROOT = Path("data/")
     vocab = MusicVocab.create()
-    encode = MusicEncode(vocab)
-    train = encode.midi_enc(DATA_ROOT / 'bwv772.mid')
-    test = encode.midi_enc(DATA_ROOT / 'bwv772.mid')
-    
-    print(train.shape,test.shape)
-    print(train)
-    #train.head()
-    
-    
-    """
-    # Find the seed to use for training
-    def seed_all(seed_value):
-        random.seed(seed_value) # Python
-        np.random.seed(seed_value) # cpu vars
-        torch.manual_seed(seed_value) # cpu  vars
-        
-        if torch.cuda.is_available(): 
-            torch.cuda.manual_seed(seed_value)
-            torch.cuda.manual_seed_all(seed_value) # gpu vars
-            torch.backends.cudnn.deterministic = True  #needed
-            torch.backends.cudnn.benchmark = False
-            
-    #seed_all(seed)
-            """
+    encode = MusicEncode(vocab)    
             
     data_path = Path('data/numpy')
     midi_files = get_files(DATA_ROOT, '.mid', recurse=True)
-    data = MusicDataBunch.from_files(midi_files, data_path, processors=[Midi2ItemProcessor()], bs=1, bptt=128, encode_position=False)
-    
-    dataE = MusicDataBunch.empty(DATA_ROOT / 'bwv772.mid')
-    print(dataE)
-    
-    databunch = DataBunch.create(train_ds = train, valid_ds = test, test_ds = test)
-    #print(databunch)
-    
-    
-    
     batch_size = 1
-    encode_position = True
-    #dl_tfms = [batch_position_tfm] if encode_position else []
+    #encode_position = True
+    
+    data = MusicDataBunch.from_files(midi_files, data_path, processors=[Midi2ItemProcessor()], bs=batch_size, bptt=128, encode_position=False)
+       
     
     config = default_config()
-    #config['encode_position'] = encode_position
-    #learn = music_model_learner(data, config=config.copy())
     print(config)
     
-    #model = get_language_model(arch=TransformerXL, vocab_sz=vocab.__len__(), config = config, drop_mult = 1.)
     
     learn = music_model_learner(data = data, config = config)
     
@@ -281,16 +240,7 @@ if __name__ == '__main__':
     
     learn.save('example')
     
-    
     cutoff_beat = 10
-    
-    """
-    item = MusicItem(encode.midi_enc(DATA_ROOT / 'bwv772.mid'), vocab, encode.file_stream(DATA_ROOT / 'bwv772.mid'))
-    seed_item = item.trim_to_beat(cutoff_beat)
-    print(seed_item)
-    print(learn.predict(seed_item, n_words = 400, temperature=1.))
-    """
-    
     
     midi_file = (DATA_ROOT / 'bwv772.mid')
     item = MusicItem.from_file(midi_file, data.vocab, encode);
